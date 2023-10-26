@@ -1,0 +1,33 @@
+[package]
+name = "modbus_proxy"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+modbus_test=["tokio-modbus", "bytes"]
+
+[[bin]]
+name = "modbus_sender"
+required-features = ["modbus_test"]
+
+[[bin]]
+name = "modbus_receiver"
+required-features = ["modbus_test"]
+
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio= {version="1", features=["rt-multi-thread", "net", "macros", "signal", "io-util", "sync", "time"]}
+tokio-util="*"
+tokio-serial={version="5.4"}
+clap= { version = "4.2", features = ["derive"] }
+systemd = {version = "0.10", optional=true}
+tracing="0.1"
+tracing-subscriber="0.3"
+log = "*"
+futures-util="*"
+futures="*"
+tokio-modbus = {version="0.5.4", default-features = false, features=["server", "tcp", "rtu", "tcp-server-unstable"], optional=true}
+bytes={version="*", optional=true}
+[dev-dependencies]
