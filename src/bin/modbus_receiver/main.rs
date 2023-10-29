@@ -1,6 +1,5 @@
 use bytes::Bytes;
 use clap::Parser;
-use futures::future::select_all;
 use log::error;
 use std::future::{self, Future};
 use std::net::SocketAddr;
@@ -9,9 +8,7 @@ use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use tokio::time::Duration;
-use tokio_modbus::client::{tcp, Context};
 use tokio_modbus::server::tcp::Server as TcpServer;
-use tokio_modbus::slave::Slave;
 
 const ILLEGAL_FUNCTION: u8 = 1;
 //const ILLEGAL_DATA_ADDRESS: u8 = 2;
@@ -41,8 +38,8 @@ impl ModbusService {
         }
     }
     pub fn print_status(&self) {
-	let state = self.state.lock().unwrap();
-	println!("Read: {:6}", state.read_count);
+        let state = self.state.lock().unwrap();
+        println!("Read: {:6}", state.read_count);
     }
 }
 
@@ -118,7 +115,7 @@ pub async fn main() -> ExitCode {
     tokio::pin!(serving);
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     loop {
-	#[rustfmt::skip]
+        #[rustfmt::skip]
 	tokio::select!{
 	    res = &mut serving => {
 		match res {

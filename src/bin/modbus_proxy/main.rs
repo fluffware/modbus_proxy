@@ -1,7 +1,7 @@
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use futures::stream::FuturesUnordered;
 use futures_util::StreamExt;
-use log::{debug, error};
+use log::{debug, error, warn};
 use modbus_proxy::daemon;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::process::ExitCode;
@@ -57,9 +57,12 @@ async fn connection_handler(
 ) -> DynResult<()> {
     let mut msg_buf = [0u8; 1024];
     let mut msg_len = 0;
-
+    if let Err(e) = stream.set_nodelay(true) {
+	warn!("Failed to set TCP_NODELAY on stream: {e}");
+    }
     let mut pending = FuturesUnordered::<oneshot::Receiver<ProxyResponse>>::new();
     'main_loop: loop {
+	#[rustfmt::skip]
         tokio::select! {
             res = stream.read(&mut msg_buf[msg_len..]) => {
                 match res {
@@ -67,33 +70,32 @@ async fn connection_handler(
                         if rlen == 0 {
                             break 'main_loop;
                         }
-            msg_len += rlen;
-            if let Some((transaction_id, request)) = parse_message(&mut msg_buf, &mut msg_len) {
-                let (respond, response) = oneshot::channel();
-        pending.push(response);
-                requests.send(ProxyRequest{transaction_id, request, respond}).await?;
-            }
-            if msg_len == msg_buf.len() {
-                // Buffer is full, but still no message. Start over.
-                msg_len = 0;
-            }
-
+			msg_len += rlen;
+			if let Some((transaction_id, request)) = parse_message(&mut msg_buf, &mut msg_len) {
+			    let (respond, response) = oneshot::channel();
+			    pending.push(response);
+			    requests.send(ProxyRequest{transaction_id, request, respond}).await?;
+			}
+			if msg_len == msg_buf.len() {
+			    warn!("Buffer overflow. Skipping.");
+			    // Buffer is full, but still no message. Start over.
+			    msg_len = 0;
+			}
                     }
                     Err(e) => {
                         return Err(e.into());
                     }
                 }
-            }
-
+            }	   
             Some(next) = pending.next(), if !pending.is_empty() => {
-        if let Ok(resp) = next {
-            let [th,tl] = resp.transaction_id.to_be_bytes();
-            let [lh, ll] = (resp.response.len() as u16).to_be_bytes();
-            let header = [th,tl, 0,0, lh,ll];
-            stream.write_all(&header).await?;
-            stream.write_all(&resp.response).await?;
-        }
-        }
+		if let Ok(resp) = next {
+		    let [th,tl] = resp.transaction_id.to_be_bytes();
+		    let [lh, ll] = (resp.response.len() as u16).to_be_bytes();
+		    let header = [th,tl, 0,0, lh,ll];
+		    stream.write_all(&header).await?;
+		    stream.write_all(&resp.response).await?;
+		}
+            }
             _ = cancel.notified() => {
                 break 'main_loop;
             }
@@ -116,6 +118,7 @@ async fn tcp_listener(
     }));
     let listener = TcpListener::bind(socket.as_slice()).await?;
     loop {
+	#[rustfmt::skip]
         tokio::select! {
             res = listener.accept() => {
                 match res {
@@ -135,11 +138,11 @@ async fn tcp_listener(
                     Some(res) => {
                         match res {
                             Ok(Err(e)) => {
-                            error!("Connection handler exited with error: {e}");
+				error!("Connection handler exited with error: {e}");
                             }
                             Ok(Ok(())) => {}
                             Err(e) => {
-                        error!("Connection handler failed: {e}");
+				error!("Connection handler failed: {e}");
                             }
                         }
                     }
@@ -150,6 +153,8 @@ async fn tcp_listener(
     }
     Ok(())
 }
+
+const SLAVE_DEVICE_FAILURE:u8 = 0x04;
 
 fn error_response(req: ProxyRequest, code: u8) {
     let func = req.request.get(1).unwrap_or(&0);
@@ -166,74 +171,96 @@ async fn tcp_client(mut requests: mpsc::Receiver<ProxyRequest>, addr: SocketAddr
         tokio::pin!(conn);
         let mut stream;
         'connect: loop {
+	    #[rustfmt::skip]
             tokio::select! {
-            res = requests.recv() => {
-                        let Some(req) = res else {break 'main_loop};
-                        error_response(req, 0x04);
-            }
-            res = conn.as_mut() => {
-                        match res {
-                Ok(s) => {
-                    stream = s;
-                    break 'connect;
-                }
-                Err(e) => {
-                    error!("Failed to connect to server {addr}: {e}");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue 'main_loop;
-                }
-                        }
-            }
+		res = requests.recv() => {
+		    debug!("Rejected request while not connected");
+                    let Some(req) = res else {break 'main_loop};
+                    error_response(req, SLAVE_DEVICE_FAILURE);
+		}
+		res = conn.as_mut() => {
+                    match res {
+			Ok(s) => {
+			    stream = s;
+			    break 'connect;
+			}
+			Err(e) => {
+			    error!("Failed to connect to server {addr}: {e}");
+			    tokio::time::sleep(Duration::from_secs(5)).await;
+			    continue 'main_loop;
+			}
+                    }
+		}
             }
         }
+	
+	if let Err(e) = stream.set_nodelay(true) {
+	    warn!("Failed to set TCP_NODELAY on stream: {e}");
+	}
+	debug!("Connected to {}", addr);
         let mut msg_buf = [0u8; 1024];
         let mut msg_len = 0;
         let mut current_req = None;
         'connected: loop {
+	    #[rustfmt::skip]
             tokio::select! {
-            res = requests.recv() => {
-                        let Some(req) = res else {break 'main_loop};
-                        let [th,tl] = req.transaction_id.to_be_bytes();
-                        let [lh, ll] = (req.request.len() as u16).to_be_bytes();
-                        let header = [th,tl, 0,0, lh,ll];
-
-                        if let Err(e) = stream.write_all(&header).await {
-                error!("Failed to write request to server: {e}");
-                break 'main_loop;
-                        }
-                        if let Err(e) = stream.write_all(&req.request).await
-                        {
-                error!("Failed to write request to server: {e}");
-                break 'main_loop;
-                        }
-                        current_req = Some(req);
+		res = requests.recv(), if current_req.is_none()=> {
+                    let Some(req) = res else {break 'main_loop};
+                    let [th,tl] = req.transaction_id.to_be_bytes();
+                    let [lh, ll] = (req.request.len() as u16).to_be_bytes();
+		    
+                    let header = [th,tl, 0,0, lh,ll];
+                    if let Err(e) = stream.write_all(&header).await {
+			error!("Failed to write request to server: {e}");
+			break 'connected;
                     }
-                    res = stream.read(&mut msg_buf[msg_len..]) => {
-                        match res {
-                            Ok(rlen) => {
-                                if rlen == 0 {
-                                    break 'connected;
-                                }
-                                msg_len += rlen;
-                                if let Some((transaction_id, response)) = parse_message(&mut msg_buf, &mut msg_len) {
-                    if let Some(req) = current_req.take() {
-                        let _ = req.respond.send(ProxyResponse{transaction_id, response});
+                    if let Err(e) = stream.write_all(&req.request).await
+                    {
+			error!("Failed to write request to server: {e}");
+			break 'connected;
                     }
-                                }
-                                if msg_len == msg_buf.len() {
-                    // Buffer is full, but still no message. Start over.
-                    msg_len = 0;
-                                }
+		     if let Err(e) = stream.flush().await {
+			error!("Failed to flush request to server: {e}");
+			break 'connected;
+		     }
 
+                    current_req = Some(req);
+                }
+		_ = tokio::time::sleep(Duration::from_millis(1000)), if current_req.is_some() => {
+		    if let Some(req) = current_req.take() {
+			error_response(req, SLAVE_DEVICE_FAILURE);
+		    }
+		    warn!("Client timeout.");
+		}
+                res = stream.read(&mut msg_buf[msg_len..]) => {
+                    match res {
+                        Ok(rlen) => {
+                            if rlen == 0 {
+                                break 'connected;
                             }
-                            Err(e) => {
-                                error!("Failed to read from client: {e}");
-                                break 'main_loop;
+                            msg_len += rlen;
+                            if let Some((transaction_id, response)) = parse_message(&mut msg_buf, &mut msg_len) {
+				if let Some(req) = current_req.take() {
+				    let _ = req.respond.send(ProxyResponse{transaction_id, response});
+				}
                             }
+                            if msg_len == msg_buf.len() {
+				// Buffer is full, but still no message. Start over.
+				msg_len = 0;
+                            }
+			    
+                        }
+                        Err(e) => {
+                            error!("Failed to read from client: {e}");
+                            break 'connected;
                         }
                     }
                 }
+            }
         }
+	if let Some(req) = current_req.take() {
+	    error_response(req, SLAVE_DEVICE_FAILURE);
+	}
     }
     Ok(())
 }
@@ -349,13 +376,13 @@ async fn main() -> ExitCode {
     tokio::pin!(client_task);
     daemon::ready();
     'main_loop: loop {
+        #[rustfmt::skip]
         tokio::select! {
             res = signal::ctrl_c() => {
                 if let Err(e) = res {
                     error!("Failed to wait for ctrl-c: {}",e);
                 }
                 cancel.notify_waiters();
-
             },
             res = net_task.as_mut() => {
                 match res {
@@ -369,15 +396,15 @@ async fn main() -> ExitCode {
                 break 'main_loop;
             }
             res = client_task.as_mut() => {
-        match res {
+		match res {
                     Ok(res) => {
                         if let Err(e) = res {
                             error!("{e}")
                         }
                     },
-            Err(e) => error!("Client task failed: {e}"),
-        }
-        break 'main_loop;
+		    Err(e) => error!("Client task failed: {e}"),
+		}
+		break 'main_loop;
             }
         }
     }
