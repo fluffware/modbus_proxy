@@ -58,11 +58,12 @@ async fn connection_handler(
     let mut msg_buf = [0u8; 1024];
     let mut msg_len = 0;
     if let Err(e) = stream.set_nodelay(true) {
-	warn!("Failed to set TCP_NODELAY on stream: {e}");
+        warn!("Failed to set TCP_NODELAY on stream: {e}");
     }
+    let mut write_buffer = Vec::new(); // Reuse this buffer to avoid reallocating it.
     let mut pending = FuturesUnordered::<oneshot::Receiver<ProxyResponse>>::new();
     'main_loop: loop {
-	#[rustfmt::skip]
+        #[rustfmt::skip]
         tokio::select! {
             res = stream.read(&mut msg_buf[msg_len..]) => {
                 match res {
@@ -92,8 +93,10 @@ async fn connection_handler(
 		    let [th,tl] = resp.transaction_id.to_be_bytes();
 		    let [lh, ll] = (resp.response.len() as u16).to_be_bytes();
 		    let header = [th,tl, 0,0, lh,ll];
-		    stream.write_all(&header).await?;
-		    stream.write_all(&resp.response).await?;
+                    write_buffer.clear();
+                    write_buffer.extend_from_slice(&header);
+                    write_buffer.extend_from_slice(&resp.response);
+		    stream.write_all(&write_buffer).await?;
 		}
             }
             _ = cancel.notified() => {
@@ -118,7 +121,7 @@ async fn tcp_listener(
     }));
     let listener = TcpListener::bind(socket.as_slice()).await?;
     loop {
-	#[rustfmt::skip]
+        #[rustfmt::skip]
         tokio::select! {
             res = listener.accept() => {
                 match res {
@@ -154,7 +157,7 @@ async fn tcp_listener(
     Ok(())
 }
 
-const SLAVE_DEVICE_FAILURE:u8 = 0x04;
+const SLAVE_DEVICE_FAILURE: u8 = 0x04;
 
 fn error_response(req: ProxyRequest, code: u8) {
     let func = req.request.get(1).unwrap_or(&0);
@@ -171,7 +174,7 @@ async fn tcp_client(mut requests: mpsc::Receiver<ProxyRequest>, addr: SocketAddr
         tokio::pin!(conn);
         let mut stream;
         'connect: loop {
-	    #[rustfmt::skip]
+            #[rustfmt::skip]
             tokio::select! {
 		res = requests.recv() => {
 		    debug!("Rejected request while not connected");
@@ -193,37 +196,37 @@ async fn tcp_client(mut requests: mpsc::Receiver<ProxyRequest>, addr: SocketAddr
 		}
             }
         }
-	
-	if let Err(e) = stream.set_nodelay(true) {
-	    warn!("Failed to set TCP_NODELAY on stream: {e}");
-	}
-	debug!("Connected to {}", addr);
+
+        if let Err(e) = stream.set_nodelay(true) {
+            warn!("Failed to set TCP_NODELAY on stream: {e}");
+        }
+        debug!("Connected to {}", addr);
+        let mut write_buffer = Vec::new(); // Reuse this buffer to avoid reallocating it.
         let mut msg_buf = [0u8; 1024];
         let mut msg_len = 0;
         let mut current_req = None;
         'connected: loop {
-	    #[rustfmt::skip]
+            #[rustfmt::skip]
             tokio::select! {
 		res = requests.recv(), if current_req.is_none()=> {
                     let Some(req) = res else {break 'main_loop};
                     let [th,tl] = req.transaction_id.to_be_bytes();
                     let [lh, ll] = (req.request.len() as u16).to_be_bytes();
-		    
+		    write_buffer.clear();
+
                     let header = [th,tl, 0,0, lh,ll];
-                    if let Err(e) = stream.write_all(&header).await {
+                    write_buffer.extend_from_slice(&header);
+                    write_buffer.extend_from_slice(&req.request);
+                    if let Err(e) = stream.write_all(&write_buffer).await {
 			error!("Failed to write request to server: {e}");
 			break 'connected;
                     }
-                    if let Err(e) = stream.write_all(&req.request).await
-                    {
-			error!("Failed to write request to server: {e}");
-			break 'connected;
-                    }
-		     if let Err(e) = stream.flush().await {
+                    
+		    if let Err(e) = stream.flush().await {
 			error!("Failed to flush request to server: {e}");
 			break 'connected;
-		     }
-
+		    }
+                    
                     current_req = Some(req);
                 }
 		_ = tokio::time::sleep(Duration::from_millis(1000)), if current_req.is_some() => {
@@ -258,9 +261,9 @@ async fn tcp_client(mut requests: mpsc::Receiver<ProxyRequest>, addr: SocketAddr
                 }
             }
         }
-	if let Some(req) = current_req.take() {
-	    error_response(req, SLAVE_DEVICE_FAILURE);
-	}
+        if let Some(req) = current_req.take() {
+            error_response(req, SLAVE_DEVICE_FAILURE);
+        }
     }
     Ok(())
 }
