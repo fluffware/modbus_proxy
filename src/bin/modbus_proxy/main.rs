@@ -161,12 +161,15 @@ const SLAVE_DEVICE_FAILURE: u8 = 0x04;
 
 fn error_response(req: ProxyRequest, code: u8) {
     let func = req.request.get(1).unwrap_or(&0);
-    req.respond
+    if let Err(_) = req.respond
         .send(ProxyResponse {
             transaction_id: req.transaction_id,
             response: vec![0x80 | func, code],
-        })
-        .unwrap();
+        }) {
+            error!("Failed to send error response");
+        }
+    
+        
 }
 async fn tcp_client(mut requests: mpsc::Receiver<ProxyRequest>, addr: SocketAddr) -> DynResult<()> {
     'main_loop: loop {
