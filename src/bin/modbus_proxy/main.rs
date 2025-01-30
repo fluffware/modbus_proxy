@@ -87,7 +87,7 @@ async fn connection_handler(
                         return Err(e.into());
                     }
                 }
-            }	   
+            }
             Some(next) = pending.next(), if !pending.is_empty() => {
 		if let Ok(resp) = next {
 		    let [th,tl] = resp.transaction_id.to_be_bytes();
@@ -161,17 +161,20 @@ const SLAVE_DEVICE_FAILURE: u8 = 0x04;
 
 fn error_response(req: ProxyRequest, code: u8) {
     let func = req.request.get(1).unwrap_or(&0);
-    if let Err(_) = req.respond
-        .send(ProxyResponse {
-            transaction_id: req.transaction_id,
-            response: vec![0x80 | func, code],
-        }) {
-            error!("Failed to send error response");
-        }
-    
-        
+    if let Err(_) = req.respond.send(ProxyResponse {
+        transaction_id: req.transaction_id,
+        response: vec![0x80 | func, code],
+    }) {
+        error!("Failed to send error response");
+    }
 }
-async fn tcp_client(mut requests: mpsc::Receiver<ProxyRequest>, addr: SocketAddr) -> DynResult<()> {
+
+const REQUEST_TIMEOUT: Duration = Duration::from_millis(2000);
+async fn tcp_client(
+    mut requests: mpsc::Receiver<ProxyRequest>,
+    addr: SocketAddr,
+    delay_time: Duration,
+) -> DynResult<()> {
     'main_loop: loop {
         let conn = TcpStream::connect(addr);
         tokio::pin!(conn);
@@ -207,65 +210,70 @@ async fn tcp_client(mut requests: mpsc::Receiver<ProxyRequest>, addr: SocketAddr
         let mut write_buffer = Vec::new(); // Reuse this buffer to avoid reallocating it.
         let mut msg_buf = [0u8; 1024];
         let mut msg_len = 0;
-        let mut current_req = None;
         'connected: loop {
-            #[rustfmt::skip]
-            tokio::select! {
-		res = requests.recv(), if current_req.is_none()=> {
-                    let Some(req) = res else {break 'main_loop};
-                    let [th,tl] = req.transaction_id.to_be_bytes();
-                    let [lh, ll] = (req.request.len() as u16).to_be_bytes();
-		    write_buffer.clear();
+            let Some(req) = requests.recv().await else {
+                break 'main_loop;
+            };
+            let [th, tl] = req.transaction_id.to_be_bytes();
+            let [lh, ll] = (req.request.len() as u16).to_be_bytes();
+            write_buffer.clear();
 
-                    let header = [th,tl, 0,0, lh,ll];
-                    write_buffer.extend_from_slice(&header);
-                    write_buffer.extend_from_slice(&req.request);
-                    if let Err(e) = stream.write_all(&write_buffer).await {
-			error!("Failed to write request to server: {e}");
-			break 'connected;
-                    }
-                    
-		    if let Err(e) = stream.flush().await {
-			error!("Failed to flush request to server: {e}");
-			break 'connected;
-		    }
-                    
-                    current_req = Some(req);
-                }
-		_ = tokio::time::sleep(Duration::from_millis(1000)), if current_req.is_some() => {
-		    if let Some(req) = current_req.take() {
-			error_response(req, SLAVE_DEVICE_FAILURE);
-		    }
-		    warn!("Client timeout.");
-		}
-                res = stream.read(&mut msg_buf[msg_len..]) => {
-                    match res {
-                        Ok(rlen) => {
-                            if rlen == 0 {
+            let header = [th, tl, 0, 0, lh, ll];
+            write_buffer.extend_from_slice(&header);
+            write_buffer.extend_from_slice(&req.request);
+            if let Err(e) = stream.write_all(&write_buffer).await {
+                error!("Failed to write request to server: {e}");
+                break 'connected;
+            }
+
+            if let Err(e) = stream.flush().await {
+                error!("Failed to flush request to server: {e}");
+                break 'connected;
+            }
+
+            'reading: loop {
+                let timeout_res =
+                    tokio::time::timeout(REQUEST_TIMEOUT, stream.read(&mut msg_buf[msg_len..]))
+                        .await;
+                match timeout_res {
+                    Ok(res) => {
+                        match res {
+                            Ok(rlen) => {
+                                if rlen == 0 {
+                                    break 'connected;
+                                }
+                                msg_len += rlen;
+                                if let Some((transaction_id, response)) =
+                                    parse_message(&mut msg_buf, &mut msg_len)
+                                {
+                                    let _ = req.respond.send(ProxyResponse {
+                                        transaction_id,
+                                        response,
+                                    });
+                                    break 'reading;
+                                }
+                                if msg_len == msg_buf.len() {
+                                    // Buffer is full, but still no message. Start over.
+                                    msg_len = 0;
+                                }
+                            }
+
+                            Err(e) => {
+                                error!("Failed to read from server: {e}");
                                 break 'connected;
                             }
-                            msg_len += rlen;
-                            if let Some((transaction_id, response)) = parse_message(&mut msg_buf, &mut msg_len) {
-				if let Some(req) = current_req.take() {
-				    let _ = req.respond.send(ProxyResponse{transaction_id, response});
-				}
-                            }
-                            if msg_len == msg_buf.len() {
-				// Buffer is full, but still no message. Start over.
-				msg_len = 0;
-                            }
-			    
                         }
-                        Err(e) => {
-                            error!("Failed to read from server: {e}");
-                            break 'connected;
-                        }
+                    }
+                    Err(_) => {
+                        error_response(req, SLAVE_DEVICE_FAILURE);
+                        warn!("Client timeout.");
+                        break 'reading;
                     }
                 }
             }
-        }
-        if let Some(req) = current_req.take() {
-            error_response(req, SLAVE_DEVICE_FAILURE);
+            if delay_time > Duration::from_secs(0) {
+                tokio::time::sleep(delay_time).await;
+            }
         }
     }
     Ok(())
@@ -369,11 +377,15 @@ async fn main() -> ExitCode {
     let net_task = tokio::spawn(tcp_listener(bind_addr, request_send, cancel.clone()));
     tokio::pin!(net_task);
     let client_task: JoinHandle<DynResult<()>> = match args.sub_commands {
-        Client::Tcp(args) => {
-            let addr = args.server_addr;
-            let port = args.server_port.unwrap_or(502);
+        Client::Tcp(tcp_args) => {
+            let addr = tcp_args.server_addr;
+            let port = tcp_args.server_port.unwrap_or(502);
             let client_addr = SocketAddr::from((addr, port));
-            tokio::spawn(tcp_client(request_recv, client_addr))
+            tokio::spawn(tcp_client(
+                request_recv,
+                client_addr,
+                Duration::from_millis(args.request_delay),
+            ))
         }
         Client::Rtu(_args) => {
             panic!("RTU not implemented");
