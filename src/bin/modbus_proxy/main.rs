@@ -257,7 +257,7 @@ async fn tcp_client(mut requests: mpsc::Receiver<ProxyRequest>, addr: SocketAddr
 			    
                         }
                         Err(e) => {
-                            error!("Failed to read from client: {e}");
+                            error!("Failed to read from server: {e}");
                             break 'connected;
                         }
                     }
@@ -286,11 +286,11 @@ enum Client {
 
 #[derive(Args, Debug)]
 struct TcpClientArgs {
-    /// Client address.
-    client_addr: IpAddr,
-    /// Client TCP port.
+    /// Server address.
+    server_addr: IpAddr,
+    /// Server TCP port.
     #[arg(long)]
-    client_port: Option<u16>,
+    server_port: Option<u16>,
 }
 
 #[derive(Args, Debug)]
@@ -370,8 +370,8 @@ async fn main() -> ExitCode {
     tokio::pin!(net_task);
     let client_task: JoinHandle<DynResult<()>> = match args.sub_commands {
         Client::Tcp(args) => {
-            let addr = args.client_addr;
-            let port = args.client_port.unwrap_or(502);
+            let addr = args.server_addr;
+            let port = args.server_port.unwrap_or(502);
             let client_addr = SocketAddr::from((addr, port));
             tokio::spawn(tcp_client(request_recv, client_addr))
         }
